@@ -1,7 +1,8 @@
 use clap::Parser;
 use hft_orderbook_gateway::network::{MulticastReceiver, TcpBroadcastServer};
 use hft_orderbook_gateway::orderbook::OrderBook;
-use hft_orderbook_gateway::protocol::{ItchParser, Side, ItchEvent};
+use hft_orderbook_gateway::protocol::{ItchEvent, ItchParser, Side};
+use hft_orderbook_gateway::pipeline::Pipeline;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -42,24 +43,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
-    info!("Starting HFT OrderBook Gateway v{}", env!("CARGO_PKG_VERSION"));
+    info!(
+        "Starting HFT OrderBook Gateway v{}",
+        env!("CARGO_PKG_VERSION")
+    );
     info!("Configuration: {:?}", args);
 
     let mc_group: Ipv4Addr = args.multicast_group.parse()?;
     let mc_iface: Ipv4Addr = args.multicast_interface.parse()?;
     let tcp_bind: SocketAddr = format!("0.0.0.0:{}", args.tcp_port).parse()?;
 
-    let order_book = Arc::new(std::sync::Mutex::new(OrderBook::new()));
+    let pipeline = Arc::new(Pipeline::new());
     let tcp_server = Arc::new(TcpBroadcastServer::new(tcp_bind)?);
 
-    let total_packets = Arc::new(AtomicU64::new(0));
     let total_events = Arc::new(AtomicU64::new(0));
     let total_bbo_updates = Arc::new(AtomicU64::new(0));
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
     {
         let running = running.clone();
-        let total_packets = total_packets.clone();
         let total_events = total_events.clone();
         let total_bbo_updates = total_bbo_updates.clone();
 
@@ -68,37 +70,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .spawn(move || {
                 while running.load(Ordering::Relaxed) {
                     thread::sleep(Duration::from_secs(1));
-                    let pkts = total_packets.swap(0, Ordering::Relaxed);
                     let evts = total_events.swap(0, Ordering::Relaxed);
                     let bbos = total_bbo_updates.swap(0, Ordering::Relaxed);
-                    if pkts > 0 || evts > 0 {
+                    if evts > 0 || bbos > 0 {
                         info!(
-                            "Stats: {} packets/sec, {} events/sec, {} BBO updates/sec",
-                            pkts, evts, bbos
+                            "Stats: {} events/sec, {} BBO updates/sec",
+                            evts, bbos
                         );
                     }
                 }
             })?;
     }
 
-    if args.enable_test_generator {
-        info!("Test data generator enabled");
-        let order_book = order_book.clone();
+    {
+        let pipeline = pipeline.clone();
         let tcp_server = tcp_server.clone();
+        let running = running.clone();
         let total_events = total_events.clone();
         let total_bbo_updates = total_bbo_updates.clone();
+
+        thread::Builder::new()
+            .name("orderbook-writer".to_string())
+            .spawn(move || {
+                run_orderbook_writer(
+                    pipeline,
+                    tcp_server,
+                    running,
+                    total_events,
+                    total_bbo_updates,
+                );
+            })?;
+    }
+
+    if args.enable_test_generator {
+        info!("Test data generator enabled (single-writer pipeline)");
+        let pipeline = pipeline.clone();
         let running = running.clone();
 
         thread::Builder::new()
             .name("test-generator".to_string())
             .spawn(move || {
-                run_test_generator(
-                    order_book,
-                    tcp_server,
-                    total_events,
-                    total_bbo_updates,
-                    running,
-                );
+                run_test_generator(pipeline, running);
             })?;
     } else {
         let receiver = MulticastReceiver::new(
@@ -112,25 +124,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             mc_group, args.multicast_port, mc_iface
         );
 
-        let order_book = order_book.clone();
-        let tcp_server = tcp_server.clone();
-        let total_packets = total_packets.clone();
-        let total_events = total_events.clone();
-        let total_bbo_updates = total_bbo_updates.clone();
+        let pipeline = pipeline.clone();
         let running = running.clone();
 
         thread::Builder::new()
             .name("multicast-consumer".to_string())
             .spawn(move || {
-                run_multicast_consumer(
-                    receiver,
-                    order_book,
-                    tcp_server,
-                    total_packets,
-                    total_events,
-                    total_bbo_updates,
-                    running,
-                );
+                run_multicast_consumer(receiver, pipeline, running);
             })?;
     }
 
@@ -153,13 +153,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_multicast_consumer(
-    mut receiver: MulticastReceiver,
-    order_book: Arc<std::sync::Mutex<OrderBook>>,
+fn run_orderbook_writer(
+    pipeline: Arc<Pipeline>,
     tcp_server: Arc<TcpBroadcastServer>,
-    total_packets: Arc<AtomicU64>,
+    running: Arc<std::sync::atomic::AtomicBool>,
     total_events: Arc<AtomicU64>,
     total_bbo_updates: Arc<AtomicU64>,
+) {
+    let mut order_book = OrderBook::new();
+    const BATCH_SIZE: usize = 1024;
+    let mut events_count: u64;
+    let mut bbo_count: u64;
+
+    while running.load(Ordering::Relaxed) {
+        events_count = 0;
+        bbo_count = 0;
+
+        for _ in 0..BATCH_SIZE {
+            match pipeline.event_tx.pop() {
+                Some(event) => {
+                    events_count += 1;
+                    if let Some(bbo) = order_book.apply_event(&event) {
+                        tcp_server.enqueue_bbo(bbo);
+                        bbo_count += 1;
+                    }
+                }
+                None => break,
+            }
+        }
+
+        if events_count > 0 {
+            total_events.fetch_add(events_count, Ordering::Relaxed);
+            total_bbo_updates.fetch_add(bbo_count, Ordering::Relaxed);
+            if !order_book.all_consistent() {
+                error!("CROSSED BOOK DETECTED inside single-writer thread!");
+            }
+        } else {
+            thread::sleep(Duration::from_micros(20));
+        }
+    }
+}
+
+fn run_multicast_consumer(
+    mut receiver: MulticastReceiver,
+    pipeline: Arc<Pipeline>,
     running: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let parser = ItchParser::new();
@@ -167,30 +204,16 @@ fn run_multicast_consumer(
     while running.load(Ordering::Relaxed) {
         match receiver.receive() {
             Ok(packet) => {
-                total_packets.fetch_add(1, Ordering::Relaxed);
-                let mut events_count = 0u64;
-                let mut bbo_count = 0u64;
-
-                {
-                    let mut ob = order_book.lock().unwrap();
-                    for result in parser.parse_multicast_packet(packet) {
-                        match result {
-                            Ok(event) => {
-                                events_count += 1;
-                                if let Some(bbo) = ob.apply_event(&event) {
-                                    tcp_server.broadcast_bbo(&bbo);
-                                    bbo_count += 1;
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Parse error: {}", e);
-                            }
+                for result in parser.parse_multicast_packet(packet) {
+                    match result {
+                        Ok(event) => {
+                            let _ = pipeline.push_event(event);
+                        }
+                        Err(e) => {
+                            warn!("Parse error: {}", e);
                         }
                     }
                 }
-
-                total_events.fetch_add(events_count, Ordering::Relaxed);
-                total_bbo_updates.fetch_add(bbo_count, Ordering::Relaxed);
             }
             Err(e) => {
                 error!("Multicast receive error: {}", e);
@@ -200,13 +223,7 @@ fn run_multicast_consumer(
     }
 }
 
-fn run_test_generator(
-    order_book: Arc<std::sync::Mutex<OrderBook>>,
-    tcp_server: Arc<TcpBroadcastServer>,
-    total_events: Arc<AtomicU64>,
-    total_bbo_updates: Arc<AtomicU64>,
-    running: Arc<std::sync::atomic::AtomicBool>,
-) {
+fn run_test_generator(pipeline: Arc<Pipeline>, running: Arc<std::sync::atomic::AtomicBool>) {
     const STOCK_AAPL: u64 = 0x4141504C20202020;
     let mut order_ref: u64 = 1;
     let mut base_price: u64 = 1_500_000;
@@ -274,22 +291,9 @@ fn run_test_generator(
             },
         ];
 
-        let mut events_count = 0u64;
-        let mut bbo_count = 0u64;
-
-        {
-            let mut ob = order_book.lock().unwrap();
-            for event in events.iter() {
-                events_count += 1;
-                if let Some(bbo) = ob.apply_event(event) {
-                    tcp_server.broadcast_bbo(&bbo);
-                    bbo_count += 1;
-                }
-            }
+        for event in events.iter() {
+            let _ = pipeline.push_event(event.clone());
         }
-
-        total_events.fetch_add(events_count, Ordering::Relaxed);
-        total_bbo_updates.fetch_add(bbo_count, Ordering::Relaxed);
 
         if tick_count % 1000 == 0 {
             let elapsed = start.elapsed();
@@ -298,10 +302,6 @@ fn run_test_generator(
             }
         }
 
-        if tcp_server.client_count() > 0 {
-            thread::sleep(Duration::from_micros(500));
-        } else {
-            thread::sleep(Duration::from_millis(1));
-        }
+        thread::sleep(Duration::from_micros(50));
     }
 }

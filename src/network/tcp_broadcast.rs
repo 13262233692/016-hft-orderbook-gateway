@@ -1,8 +1,10 @@
 use crate::orderbook::{BboUpdate, BBO_SERIALIZED_SIZE};
 use arrayvec::ArrayVec;
+use crossbeam_queue::ArrayQueue;
 use parking_lot::RwLock;
 use std::io::{ErrorKind, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -10,6 +12,7 @@ use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
 const MAX_CLIENTS: usize = 256;
+const BROADCAST_QUEUE_CAP: usize = 1 << 15;
 
 #[derive(Error, Debug)]
 pub enum BroadcastError {
@@ -26,8 +29,10 @@ struct ClientConnection {
 
 pub struct TcpBroadcastServer {
     clients: Arc<RwLock<ArrayVec<ClientConnection, MAX_CLIENTS>>>,
+    broadcast_queue: Arc<ArrayQueue<BboUpdate>>,
     listener_addr: SocketAddr,
     running: Arc<std::sync::atomic::AtomicBool>,
+    dropped_count: Arc<AtomicU64>,
 }
 
 impl TcpBroadcastServer {
@@ -35,27 +40,45 @@ impl TcpBroadcastServer {
         let clients: Arc<RwLock<ArrayVec<ClientConnection, MAX_CLIENTS>>> =
             Arc::new(RwLock::new(ArrayVec::new()));
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let broadcast_queue = Arc::new(ArrayQueue::new(BROADCAST_QUEUE_CAP));
+        let dropped_count = Arc::new(AtomicU64::new(0));
 
         let listener = TcpListener::bind(bind_addr)?;
         listener.set_nonblocking(true)?;
         let listener_addr = listener.local_addr()?;
 
-        let clients_clone = clients.clone();
-        let running_clone = running.clone();
+        {
+            let clients_clone = clients.clone();
+            let running_clone = running.clone();
+            thread::Builder::new()
+                .name("tcp-acceptor".to_string())
+                .spawn(move || {
+                    Self::accept_loop(listener, clients_clone, running_clone);
+                })
+                .expect("Failed to spawn TCP acceptor thread");
+        }
 
-        thread::Builder::new()
-            .name("tcp-acceptor".to_string())
-            .spawn(move || {
-                Self::accept_loop(listener, clients_clone, running_clone);
-            })
-            .expect("Failed to spawn TCP acceptor thread");
+        {
+            let clients_clone = clients.clone();
+            let running_clone = running.clone();
+            let queue_clone = broadcast_queue.clone();
+            let dropped_clone = dropped_count.clone();
+            thread::Builder::new()
+                .name("tcp-broadcaster".to_string())
+                .spawn(move || {
+                    Self::broadcast_loop(queue_clone, clients_clone, running_clone, dropped_clone);
+                })
+                .expect("Failed to spawn TCP broadcaster thread");
+        }
 
         info!("TCP broadcast server listening on {}", listener_addr);
 
         Ok(Self {
             clients,
+            broadcast_queue,
             listener_addr,
             running,
+            dropped_count,
         })
     }
 
@@ -68,7 +91,7 @@ impl TcpBroadcastServer {
         clients: Arc<RwLock<ArrayVec<ClientConnection, MAX_CLIENTS>>>,
         running: Arc<std::sync::atomic::AtomicBool>,
     ) {
-        while running.load(std::sync::atomic::Ordering::Relaxed) {
+        while running.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((stream, addr)) => {
                     debug!("New TCP client connecting from {}", addr);
@@ -104,22 +127,56 @@ impl TcpBroadcastServer {
         }
     }
 
-    #[inline(always)]
-    pub fn broadcast_bbo(&self, bbo: &BboUpdate) {
-        let mut buf = [0u8; BBO_SERIALIZED_SIZE + 2];
-        let header: u16 = (BBO_SERIALIZED_SIZE as u16).to_le();
-        buf[0..2].copy_from_slice(&header.to_le_bytes());
-        bbo.serialize(
-            (&mut buf[2..2 + BBO_SERIALIZED_SIZE])
-                .try_into()
-                .unwrap(),
-        );
-        self.broadcast_raw(&buf);
+    fn broadcast_loop(
+        queue: Arc<ArrayQueue<BboUpdate>>,
+        clients: Arc<RwLock<ArrayVec<ClientConnection, MAX_CLIENTS>>>,
+        running: Arc<std::sync::atomic::AtomicBool>,
+        dropped_count: Arc<AtomicU64>,
+    ) {
+        const BATCH_SIZE: usize = 64;
+        let mut batch = ArrayVec::<BboUpdate, BATCH_SIZE>::new();
+
+        while running.load(Ordering::Relaxed) {
+            while batch.len() < BATCH_SIZE {
+                match queue.pop() {
+                    Some(bbo) => batch.push(bbo),
+                    None => break,
+                }
+            }
+
+            if batch.is_empty() {
+                thread::sleep(Duration::from_micros(50));
+                continue;
+            }
+
+            let mut buf = [0u8; (BBO_SERIALIZED_SIZE + 2) * BATCH_SIZE];
+            let mut total_len = 0usize;
+            for bbo in batch.iter() {
+                let header: u16 = BBO_SERIALIZED_SIZE as u16;
+                buf[total_len..total_len + 2].copy_from_slice(&header.to_le_bytes());
+                let payload: &mut [u8; BBO_SERIALIZED_SIZE] = (&mut buf
+                    [total_len + 2..total_len + 2 + BBO_SERIALIZED_SIZE])
+                    .try_into()
+                    .unwrap();
+                bbo.serialize(payload);
+                total_len += 2 + BBO_SERIALIZED_SIZE;
+            }
+
+            Self::broadcast_bytes(&clients, &buf[..total_len]);
+            batch.clear();
+
+            let dropped = dropped_count.swap(0, Ordering::Relaxed);
+            if dropped > 0 {
+                warn!("Dropped {} BBO updates due to queue overflow", dropped);
+            }
+        }
     }
 
-    #[inline(always)]
-    pub fn broadcast_raw(&self, data: &[u8]) {
-        let mut clients = self.clients.write();
+    fn broadcast_bytes(
+        clients: &Arc<RwLock<ArrayVec<ClientConnection, MAX_CLIENTS>>>,
+        data: &[u8],
+    ) {
+        let mut clients = clients.write();
         let mut to_remove = ArrayVec::<usize, 64>::new();
 
         for (idx, client) in clients.iter_mut().enumerate() {
@@ -152,13 +209,29 @@ impl TcpBroadcastServer {
         }
     }
 
+    #[inline(always)]
+    pub fn enqueue_bbo(&self, bbo: BboUpdate) {
+        if let Err(bbo) = self.broadcast_queue.push(bbo) {
+            self.dropped_count.fetch_add(1, Ordering::Relaxed);
+            drop(bbo);
+        }
+    }
+
+    #[inline(always)]
+    pub fn broadcast_bbo(&self, bbo: &BboUpdate) {
+        self.enqueue_bbo(bbo.clone());
+    }
+
     pub fn client_count(&self) -> usize {
         self.clients.read().len()
     }
 
+    pub fn queue_len(&self) -> usize {
+        self.broadcast_queue.len()
+    }
+
     pub fn shutdown(&self) {
-        self.running
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.running.store(false, Ordering::Relaxed);
         let mut clients = self.clients.write();
         for client in clients.drain(..) {
             let _ = client.stream.shutdown(std::net::Shutdown::Both);
@@ -195,7 +268,9 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
 
         let mut stream = TcpStream::connect(server_addr).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
 
         thread::sleep(Duration::from_millis(50));
         assert_eq!(server.client_count(), 1);
@@ -212,7 +287,8 @@ mod tests {
             top_asks: ArrayVec::new(),
         };
 
-        server.broadcast_bbo(&bbo);
+        server.enqueue_bbo(bbo);
+        thread::sleep(Duration::from_millis(100));
 
         let mut header_buf = [0u8; 2];
         stream.read_exact(&mut header_buf).unwrap();

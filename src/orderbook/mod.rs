@@ -35,6 +35,31 @@ impl PriceLevel {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BboSnapshot {
+    bid_price: u64,
+    bid_volume: u64,
+    ask_price: u64,
+    ask_volume: u64,
+}
+
+impl BboSnapshot {
+    #[inline(always)]
+    const fn zero() -> Self {
+        Self {
+            bid_price: 0,
+            bid_volume: 0,
+            ask_price: 0,
+            ask_volume: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn is_crossed(&self) -> bool {
+        self.bid_price != 0 && self.ask_price != 0 && self.bid_price > self.ask_price
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BboUpdate {
     pub stock: u64,
@@ -85,14 +110,14 @@ impl BboUpdate {
 }
 
 #[derive(Debug, Clone)]
-struct OrderInfo {
+pub(crate) struct OrderInfo {
     side: Side,
     price: u64,
     shares: u32,
 }
 
 #[derive(Debug)]
-struct BookSide {
+pub(crate) struct BookSide {
     levels: BTreeMap<u64, PriceLevel>,
     side: Side,
 }
@@ -102,6 +127,25 @@ impl BookSide {
         Self {
             levels: BTreeMap::new(),
             side,
+        }
+    }
+
+    #[inline(always)]
+    fn best_snapshot(&self) -> (u64, u64) {
+        match self.side {
+            Side::Buy => self
+                .levels
+                .values()
+                .rev()
+                .next()
+                .map(|l| (l.price, l.volume))
+                .unwrap_or((0, 0)),
+            Side::Sell => self
+                .levels
+                .values()
+                .next()
+                .map(|l| (l.price, l.volume))
+                .unwrap_or((0, 0)),
         }
     }
 
@@ -121,25 +165,21 @@ impl BookSide {
                 level.order_count += 1;
             }
             None => {
-                self.levels.insert(
-                    price,
-                    PriceLevel::new(price, shares as u64, 1),
-                );
+                self.levels
+                    .insert(price, PriceLevel::new(price, shares as u64, 1));
             }
         }
     }
 
     #[inline(always)]
-    fn remove_shares(&mut self, price: u64, shares: u32) -> bool {
+    fn remove_shares(&mut self, price: u64, shares: u32) {
         if let Some(level) = self.levels.get_mut(&price) {
             level.volume = level.volume.saturating_sub(shares as u64);
             level.order_count = level.order_count.saturating_sub(1);
             if level.volume == 0 {
                 self.levels.remove(&price);
-                return true;
             }
         }
-        false
     }
 
     #[inline(always)]
@@ -149,6 +189,46 @@ impl BookSide {
             level.order_count = level.order_count.saturating_sub(1);
             if level.volume == 0 {
                 self.levels.remove(&price);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn replace_atomically(&mut self, old_price: u64, old_shares: u32, new_price: u64, new_shares: u32) {
+        if old_price == new_price {
+            if let Some(level) = self.levels.get_mut(&old_price) {
+                level.volume = level.volume.saturating_sub(old_shares as u64) + new_shares as u64;
+                if level.volume == 0 {
+                    self.levels.remove(&old_price);
+                }
+            } else {
+                self.levels
+                    .insert(new_price, PriceLevel::new(new_price, new_shares as u64, 1));
+            }
+            return;
+        }
+
+        let needs_insert_new = if let Some(level) = self.levels.get_mut(&old_price) {
+            level.volume = level.volume.saturating_sub(old_shares as u64);
+            level.order_count = level.order_count.saturating_sub(1);
+            if level.volume == 0 {
+                self.levels.remove(&old_price);
+            }
+            true
+        } else {
+            true
+        };
+
+        if needs_insert_new {
+            match self.levels.get_mut(&new_price) {
+                Some(level) => {
+                    level.volume += new_shares as u64;
+                    level.order_count += 1;
+                }
+                None => {
+                    self.levels
+                        .insert(new_price, PriceLevel::new(new_price, new_shares as u64, 1));
+                }
             }
         }
     }
@@ -174,15 +254,13 @@ impl BookSide {
 
 #[derive(Debug)]
 pub struct SingleOrderBook {
-    stock: u64,
-    bids: BookSide,
-    asks: BookSide,
-    orders: AHashMap<u64, OrderInfo>,
-    last_bbo_bid: u64,
-    last_bbo_ask: u64,
-    last_bbo_bid_vol: u64,
-    last_bbo_ask_vol: u64,
+    pub(crate) stock: u64,
+    pub(crate) bids: BookSide,
+    pub(crate) asks: BookSide,
+    pub(crate) orders: AHashMap<u64, OrderInfo>,
+    last_snapshot: BboSnapshot,
     seq_num: AtomicU64,
+    generation: u64,
 }
 
 impl SingleOrderBook {
@@ -192,11 +270,9 @@ impl SingleOrderBook {
             bids: BookSide::new(Side::Buy),
             asks: BookSide::new(Side::Sell),
             orders: AHashMap::with_capacity(65536),
-            last_bbo_bid: 0,
-            last_bbo_ask: 0,
-            last_bbo_bid_vol: 0,
-            last_bbo_ask_vol: 0,
+            last_snapshot: BboSnapshot::zero(),
             seq_num: AtomicU64::new(0),
+            generation: 0,
         }
     }
 
@@ -206,55 +282,41 @@ impl SingleOrderBook {
     }
 
     #[inline(always)]
-    fn bbo_changed(&self) -> bool {
-        let bid = self.bids.best();
-        let ask = self.asks.best();
-        let cur_bid = bid.map(|l| l.price).unwrap_or(0);
-        let cur_ask = ask.map(|l| l.price).unwrap_or(0);
-        let cur_bid_vol = bid.map(|l| l.volume).unwrap_or(0);
-        let cur_ask_vol = ask.map(|l| l.volume).unwrap_or(0);
-
-        cur_bid != self.last_bbo_bid
-            || cur_ask != self.last_bbo_ask
-            || cur_bid_vol != self.last_bbo_bid_vol
-            || cur_ask_vol != self.last_bbo_ask_vol
-    }
-
-    #[inline(always)]
-    fn update_last_bbo(&mut self) {
-        let bid = self.bids.best();
-        let ask = self.asks.best();
-        self.last_bbo_bid = bid.map(|l| l.price).unwrap_or(0);
-        self.last_bbo_ask = ask.map(|l| l.price).unwrap_or(0);
-        self.last_bbo_bid_vol = bid.map(|l| l.volume).unwrap_or(0);
-        self.last_bbo_ask_vol = ask.map(|l| l.volume).unwrap_or(0);
-    }
-
-    #[inline(always)]
-    fn create_bbo_update(&self, timestamp: u64) -> Option<BboUpdate> {
-        if !self.bbo_changed() {
-            return None;
+    fn snapshot_bbo(&self) -> BboSnapshot {
+        let (bid_price, bid_volume) = self.bids.best_snapshot();
+        let (ask_price, ask_volume) = self.asks.best_snapshot();
+        BboSnapshot {
+            bid_price,
+            bid_volume,
+            ask_price,
+            ask_volume,
         }
+    }
 
-        let bid = self.bids.best();
-        let ask = self.asks.best();
-
-        Some(BboUpdate {
+    #[inline(always)]
+    fn create_bbo_update(
+        &self,
+        timestamp: u64,
+        snapshot: BboSnapshot,
+    ) -> BboUpdate {
+        BboUpdate {
             stock: self.stock,
             timestamp,
             seq_num: self.seq_num.fetch_add(1, Ordering::Relaxed),
-            bid_price: bid.map(|l| l.price).unwrap_or(0),
-            bid_volume: bid.map(|l| l.volume).unwrap_or(0),
-            ask_price: ask.map(|l| l.price).unwrap_or(0),
-            ask_volume: ask.map(|l| l.volume).unwrap_or(0),
+            bid_price: snapshot.bid_price,
+            bid_volume: snapshot.bid_volume,
+            ask_price: snapshot.ask_price,
+            ask_volume: snapshot.ask_volume,
             top_bids: self.bids.top_n::<10>(),
             top_asks: self.asks.top_n::<10>(),
-        })
+        }
     }
 
     #[inline(always)]
     pub fn apply_event(&mut self, event: &ItchEvent) -> Option<BboUpdate> {
         let ts = event.timestamp();
+        let mut touched = false;
+
         match event {
             ItchEvent::AddOrder {
                 order_ref,
@@ -285,6 +347,7 @@ impl SingleOrderBook {
                     Side::Sell => self.asks.add_order(*price, *shares),
                 }
                 let _ = stock;
+                touched = true;
             }
 
             ItchEvent::OrderExecuted {
@@ -299,16 +362,15 @@ impl SingleOrderBook {
             } => {
                 if let Some(info) = self.orders.get_mut(order_ref) {
                     let executed_shares = (*shares).min(info.shares);
-                    info.shares -= executed_shares;
-                    let side = info.side;
-                    let price = info.price;
-                    match side {
-                        Side::Buy => {
-                            self.bids.remove_shares(price, executed_shares);
+                    if executed_shares > 0 {
+                        info.shares -= executed_shares;
+                        let side = info.side;
+                        let price = info.price;
+                        match side {
+                            Side::Buy => self.bids.remove_shares(price, executed_shares),
+                            Side::Sell => self.asks.remove_shares(price, executed_shares),
                         }
-                        Side::Sell => {
-                            self.asks.remove_shares(price, executed_shares);
-                        }
+                        touched = true;
                     }
                     if info.shares == 0 {
                         self.orders.remove(order_ref);
@@ -323,16 +385,15 @@ impl SingleOrderBook {
             } => {
                 if let Some(info) = self.orders.get_mut(order_ref) {
                     let cancel_shares = (*shares).min(info.shares);
-                    info.shares -= cancel_shares;
-                    let side = info.side;
-                    let price = info.price;
-                    match side {
-                        Side::Buy => {
-                            self.bids.remove_shares(price, cancel_shares);
+                    if cancel_shares > 0 {
+                        info.shares -= cancel_shares;
+                        let side = info.side;
+                        let price = info.price;
+                        match side {
+                            Side::Buy => self.bids.remove_shares(price, cancel_shares),
+                            Side::Sell => self.asks.remove_shares(price, cancel_shares),
                         }
-                        Side::Sell => {
-                            self.asks.remove_shares(price, cancel_shares);
-                        }
+                        touched = true;
                     }
                     if info.shares == 0 {
                         self.orders.remove(order_ref);
@@ -343,13 +404,10 @@ impl SingleOrderBook {
             ItchEvent::OrderDelete { order_ref, .. } => {
                 if let Some(info) = self.orders.remove(order_ref) {
                     match info.side {
-                        Side::Buy => {
-                            self.bids.delete_all_at_price(info.price, info.shares);
-                        }
-                        Side::Sell => {
-                            self.asks.delete_all_at_price(info.price, info.shares);
-                        }
+                        Side::Buy => self.bids.delete_all_at_price(info.price, info.shares),
+                        Side::Sell => self.asks.delete_all_at_price(info.price, info.shares),
                     }
+                    touched = true;
                 }
             }
 
@@ -361,35 +419,57 @@ impl SingleOrderBook {
                 ..
             } => {
                 if let Some(old_info) = self.orders.remove(order_ref) {
-                    match old_info.side {
-                        Side::Buy => {
-                            self.bids.delete_all_at_price(old_info.price, old_info.shares);
-                            self.bids.add_order(*price, *shares);
-                        }
-                        Side::Sell => {
-                            self.asks.delete_all_at_price(old_info.price, old_info.shares);
-                            self.asks.add_order(*price, *shares);
-                        }
+                    let new_price = *price;
+                    let new_shares = *shares;
+                    let side = old_info.side;
+
+                    match side {
+                        Side::Buy => self
+                            .bids
+                            .replace_atomically(old_info.price, old_info.shares, new_price, new_shares),
+                        Side::Sell => self
+                            .asks
+                            .replace_atomically(old_info.price, old_info.shares, new_price, new_shares),
                     }
+
                     self.orders.insert(
                         *new_order_ref,
                         OrderInfo {
-                            side: old_info.side,
-                            price: *price,
-                            shares: *shares,
+                            side,
+                            price: new_price,
+                            shares: new_shares,
                         },
                     );
+                    touched = true;
                 }
             }
 
             _ => {}
         }
 
-        let bbo = self.create_bbo_update(ts);
-        if bbo.is_some() {
-            self.update_last_bbo();
+        if !touched {
+            return None;
         }
-        bbo
+
+        self.generation = self.generation.wrapping_add(1);
+
+        let snap = self.snapshot_bbo();
+
+        debug_assert!(
+            !snap.is_crossed(),
+            "Crossed book detected for stock={:#018X}: bid={} ask={} gen={}",
+            self.stock,
+            snap.bid_price,
+            snap.ask_price,
+            self.generation
+        );
+
+        if snap == self.last_snapshot {
+            return None;
+        }
+
+        self.last_snapshot = snap;
+        Some(self.create_bbo_update(ts, snap))
     }
 
     #[inline(always)]
@@ -411,16 +491,23 @@ impl SingleOrderBook {
     pub fn top_asks<const N: usize>(&self) -> ArrayVec<PriceLevel, N> {
         self.asks.top_n()
     }
+
+    #[inline(always)]
+    pub fn is_consistent(&self) -> bool {
+        !self.snapshot_bbo().is_crossed()
+    }
 }
 
 pub struct OrderBook {
     books: AHashMap<u64, SingleOrderBook>,
+    order_to_stock: AHashMap<u64, u64>,
 }
 
 impl OrderBook {
     pub fn new() -> Self {
         Self {
             books: AHashMap::with_capacity(1024),
+            order_to_stock: AHashMap::with_capacity(65536),
         }
     }
 
@@ -439,57 +526,71 @@ impl OrderBook {
     #[inline(always)]
     pub fn apply_event(&mut self, event: &ItchEvent) -> Option<BboUpdate> {
         match event {
-            ItchEvent::AddOrder { stock, .. }
-            | ItchEvent::AddOrderMpid { stock, .. } => {
+            ItchEvent::AddOrder {
+                order_ref, stock, ..
+            }
+            | ItchEvent::AddOrderMpid {
+                order_ref, stock, ..
+            } => {
+                self.order_to_stock.insert(*order_ref, *stock);
                 let book = self.get_or_create(*stock);
                 book.apply_event(event)
             }
+
+            ItchEvent::OrderReplace {
+                order_ref,
+                new_order_ref,
+                ..
+            } => {
+                let maybe_stock = self.order_to_stock.get(order_ref).copied();
+                if let Some(stock) = maybe_stock {
+                    self.order_to_stock.remove(order_ref);
+                    self.order_to_stock.insert(*new_order_ref, stock);
+                    let book = self.get_or_create(stock);
+                    book.apply_event(event)
+                } else {
+                    None
+                }
+            }
+
             ItchEvent::OrderExecuted { order_ref, .. }
             | ItchEvent::OrderExecutedPrice { order_ref, .. }
-            | ItchEvent::OrderCancel { order_ref, .. }
-            | ItchEvent::OrderDelete { order_ref, .. } => {
-                let stock = self.find_stock_for_order(*order_ref);
-                if let Some(stock) = stock {
-                    let book = self.get_or_create(stock);
-                    book.apply_event(event)
-                } else {
-                    let mut result = None;
-                    for book in self.books.values_mut() {
-                        if book.orders.contains_key(order_ref) {
-                            result = book.apply_event(event);
-                            break;
-                        }
+            | ItchEvent::OrderCancel { order_ref, .. } => {
+                let maybe_stock = self.order_to_stock.get(order_ref).copied();
+                if let Some(stock) = maybe_stock {
+                    let (result, shares_remaining) = {
+                        let book = self.get_or_create(stock);
+                        let result = book.apply_event(event);
+                        let shares_remaining = book
+                            .orders
+                            .get(order_ref)
+                            .map(|info| info.shares)
+                            .unwrap_or(0);
+                        (result, shares_remaining)
+                    };
+                    if shares_remaining == 0 {
+                        self.order_to_stock.remove(order_ref);
                     }
                     result
-                }
-            }
-            ItchEvent::OrderReplace { order_ref, .. } => {
-                let stock = self.find_stock_for_order(*order_ref);
-                if let Some(stock) = stock {
-                    let book = self.get_or_create(stock);
-                    book.apply_event(event)
                 } else {
-                    let mut result = None;
-                    for book in self.books.values_mut() {
-                        if book.orders.contains_key(order_ref) {
-                            result = book.apply_event(event);
-                            break;
-                        }
-                    }
-                    result
+                    None
                 }
             }
+
+            ItchEvent::OrderDelete { order_ref, .. } => {
+                self.order_to_stock.remove(order_ref);
+                let mut result = None;
+                for book in self.books.values_mut() {
+                    if book.orders.contains_key(order_ref) {
+                        result = book.apply_event(event);
+                        break;
+                    }
+                }
+                result
+            }
+
             _ => None,
         }
-    }
-
-    fn find_stock_for_order(&self, order_ref: u64) -> Option<u64> {
-        for book in self.books.values() {
-            if book.orders.contains_key(&order_ref) {
-                return Some(book.stock);
-            }
-        }
-        None
     }
 
     #[inline(always)]
@@ -505,6 +606,11 @@ impl OrderBook {
     pub fn iter_books(&self) -> impl Iterator<Item = &SingleOrderBook> {
         self.books.values()
     }
+
+    #[inline(always)]
+    pub fn all_consistent(&self) -> bool {
+        self.books.values().all(|b| b.is_consistent())
+    }
 }
 
 impl Default for OrderBook {
@@ -517,6 +623,8 @@ impl Default for OrderBook {
 mod tests {
     use super::*;
     use crate::protocol::ItchEvent;
+    use std::sync::Arc;
+    use std::thread;
 
     const TEST_STOCK: u64 = 0x4141504C20202020;
 
@@ -583,6 +691,7 @@ mod tests {
         assert!(bbo.is_some());
         let bbo = bbo.unwrap();
         assert_eq!(bbo.bid_volume, 150);
+        assert!(book.is_consistent());
     }
 
     #[test]
@@ -601,6 +710,7 @@ mod tests {
         let best_bid = book.best_bid().unwrap();
         assert_eq!(best_bid.volume, 200);
         assert_eq!(best_bid.order_count, 1);
+        assert!(book.is_consistent());
     }
 
     #[test]
@@ -614,6 +724,7 @@ mod tests {
         let best_bid = book.best_bid().unwrap();
         assert_eq!(best_bid.volume, 70);
         assert_eq!(best_bid.order_count, 0);
+        assert!(book.is_consistent());
     }
 
     #[test]
@@ -627,6 +738,66 @@ mod tests {
         let best_bid = book.best_bid().unwrap();
         assert_eq!(best_bid.price, 1050000);
         assert_eq!(best_bid.volume, 150);
+        assert!(book.is_consistent());
+    }
+
+    #[test]
+    fn test_order_replace_same_price() {
+        let mut book = SingleOrderBook::new(TEST_STOCK);
+
+        book.apply_event(&add_order_event(1, Side::Buy, 100, 1000000));
+        book.apply_event(&add_order_event(2, Side::Buy, 100, 1000000));
+        let bbo = book.apply_event(&replace_order_event(1, 3, 200, 1000000));
+        assert!(bbo.is_some());
+
+        let best_bid = book.best_bid().unwrap();
+        assert_eq!(best_bid.price, 1000000);
+        assert_eq!(best_bid.volume, 300);
+        assert_eq!(best_bid.order_count, 2);
+        assert!(book.is_consistent());
+    }
+
+    #[test]
+    fn test_replace_storm_no_cross() {
+        let mut book = SingleOrderBook::new(TEST_STOCK);
+
+        for i in 0..100 {
+            let buy_price = 900_000 + (i % 50) * 1000;
+            let sell_price = 1_100_000 + (i % 50) * 1000;
+            book.apply_event(&add_order_event(i * 2 + 1, Side::Buy, 100, buy_price));
+            book.apply_event(&add_order_event(i * 2 + 2, Side::Sell, 150, sell_price));
+        }
+        assert!(book.is_consistent());
+
+        for i in 0..100_000 {
+            let old_ref = (i % 200) + 1;
+            let new_ref = 10_000 + i;
+            let side = if old_ref % 2 == 1 { Side::Buy } else { Side::Sell };
+            let drift = (i % 100) as u64 * 500;
+            let new_price = if side == Side::Buy { 800_000 + drift } else { 1_200_000 + drift };
+            book.apply_event(&replace_order_event(old_ref, new_ref, 100 + (i % 500) as u32, new_price));
+            assert!(
+                book.is_consistent(),
+                "Crossed book after replace #{}: bid={:?} ask={:?}",
+                i,
+                book.best_bid(),
+                book.best_ask()
+            );
+        }
+    }
+
+    #[test]
+    fn test_bbo_change_detection_no_false_positive() {
+        let mut book = SingleOrderBook::new(TEST_STOCK);
+
+        book.apply_event(&add_order_event(1, Side::Buy, 100, 1000000));
+        book.apply_event(&add_order_event(2, Side::Sell, 100, 1100000));
+
+        let bbo = book.apply_event(&add_order_event(3, Side::Buy, 50, 900000));
+        assert!(bbo.is_none(), "Non-top add should not trigger BBO update");
+
+        let bbo = book.apply_event(&add_order_event(4, Side::Sell, 50, 1200000));
+        assert!(bbo.is_none(), "Non-top add should not trigger BBO update");
     }
 
     #[test]
@@ -695,6 +866,48 @@ mod tests {
 
         assert_eq!(book_a.best_bid().unwrap().price, 1000000);
         assert_eq!(book_b.best_bid().unwrap().price, 2000000);
+        assert!(ob.all_consistent());
+    }
+
+    #[test]
+    fn test_multistock_replace() {
+        let mut ob = OrderBook::new();
+        const STOCK_A: u64 = 0x4141504C20202020;
+        const STOCK_B: u64 = 0x4D53465420202020;
+
+        ob.apply_event(&ItchEvent::AddOrder {
+            timestamp: 1,
+            order_ref: 1,
+            side: Side::Buy,
+            shares: 100,
+            stock: STOCK_A,
+            price: 1000000,
+        });
+
+        ob.apply_event(&ItchEvent::AddOrder {
+            timestamp: 1,
+            order_ref: 100,
+            side: Side::Buy,
+            shares: 200,
+            stock: STOCK_B,
+            price: 2000000,
+        });
+
+        ob.apply_event(&ItchEvent::OrderReplace {
+            timestamp: 2,
+            order_ref: 1,
+            new_order_ref: 2,
+            shares: 300,
+            price: 1500000,
+        });
+
+        let book_a = ob.get(STOCK_A).unwrap();
+        assert_eq!(book_a.best_bid().unwrap().price, 1500000);
+        assert_eq!(book_a.best_bid().unwrap().volume, 300);
+
+        let book_b = ob.get(STOCK_B).unwrap();
+        assert_eq!(book_b.best_bid().unwrap().price, 2000000);
+        assert!(ob.all_consistent());
     }
 
     #[test]
@@ -721,5 +934,118 @@ mod tests {
         assert_eq!(u64::from_le_bytes(buf[32..40].try_into().unwrap()), 500);
         assert_eq!(u64::from_le_bytes(buf[40..48].try_into().unwrap()), 1010000);
         assert_eq!(u64::from_le_bytes(buf[48..56].try_into().unwrap()), 300);
+    }
+
+    #[test]
+    fn test_concurrent_bbo_read_consistency() {
+        let ob = Arc::new(parking_lot::Mutex::new(OrderBook::new()));
+        const STOCK_A: u64 = 0x4141504C20202020;
+        const STOCK_B: u64 = 0x4D53465420202020;
+
+        {
+            let mut guard = ob.lock();
+            for i in 0..50 {
+                guard.apply_event(&ItchEvent::AddOrder {
+                    timestamp: i,
+                    order_ref: i * 4 + 1,
+                    side: Side::Buy,
+                    shares: 100,
+                    stock: STOCK_A,
+                    price: 1_000_000 + i * 100,
+                });
+                guard.apply_event(&ItchEvent::AddOrder {
+                    timestamp: i,
+                    order_ref: i * 4 + 2,
+                    side: Side::Sell,
+                    shares: 100,
+                    stock: STOCK_A,
+                    price: 2_000_000 + i * 100,
+                });
+                guard.apply_event(&ItchEvent::AddOrder {
+                    timestamp: i,
+                    order_ref: i * 4 + 3,
+                    side: Side::Buy,
+                    shares: 100,
+                    stock: STOCK_B,
+                    price: 3_000_000 + i * 100,
+                });
+                guard.apply_event(&ItchEvent::AddOrder {
+                    timestamp: i,
+                    order_ref: i * 4 + 4,
+                    side: Side::Sell,
+                    shares: 100,
+                    stock: STOCK_B,
+                    price: 4_000_000 + i * 100,
+                });
+            }
+        }
+
+        let ob_writer = ob.clone();
+        let writer = thread::spawn(move || {
+            for i in 0..20_000 {
+                let mut guard = ob_writer.lock();
+                let order_ref = (i % 200) * 4 + 1;
+                let new_ref = 100_000 + i;
+                guard.apply_event(&ItchEvent::OrderReplace {
+                    timestamp: i,
+                    order_ref,
+                    new_order_ref: new_ref,
+                    shares: 100 + (i % 500) as u32,
+                    price: 1_000_000 + (i % 200) as u64 * 100,
+                });
+
+                let order_ref = (i % 200) * 4 + 3;
+                let new_ref = 500_000 + i;
+                guard.apply_event(&ItchEvent::OrderReplace {
+                    timestamp: i,
+                    order_ref,
+                    new_order_ref: new_ref,
+                    shares: 100 + (i % 500) as u32,
+                    price: 3_000_000 + (i % 200) as u64 * 100,
+                });
+                assert!(
+                    guard.all_consistent(),
+                    "Crossed book at writer iteration #{}",
+                    i
+                );
+            }
+        });
+
+        let ob_reader = ob.clone();
+        let reader = thread::spawn(move || {
+            for _ in 0..20_000 {
+                let guard = ob_reader.lock();
+                if let Some(book) = guard.get(STOCK_A) {
+                    let bid = book.best_bid().map(|l| l.price).unwrap_or(0);
+                    let ask = book.best_ask().map(|l| l.price).unwrap_or(0);
+                    if bid != 0 && ask != 0 {
+                        assert!(
+                            bid < ask,
+                            "Crossed book read: bid={} ask={}",
+                            bid,
+                            ask
+                        );
+                    }
+                }
+                if let Some(book) = guard.get(STOCK_B) {
+                    let bid = book.best_bid().map(|l| l.price).unwrap_or(0);
+                    let ask = book.best_ask().map(|l| l.price).unwrap_or(0);
+                    if bid != 0 && ask != 0 {
+                        assert!(
+                            bid < ask,
+                            "Crossed book read: bid={} ask={}",
+                            bid,
+                            ask
+                        );
+                    }
+                }
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        let guard = ob.lock();
+        assert!(guard.all_consistent());
     }
 }
