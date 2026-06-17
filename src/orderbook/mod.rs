@@ -36,16 +36,16 @@ impl PriceLevel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BboSnapshot {
-    bid_price: u64,
-    bid_volume: u64,
-    ask_price: u64,
-    ask_volume: u64,
+pub struct BboSnapshot {
+    pub bid_price: u64,
+    pub bid_volume: u64,
+    pub ask_price: u64,
+    pub ask_volume: u64,
 }
 
 impl BboSnapshot {
     #[inline(always)]
-    const fn zero() -> Self {
+    pub const fn zero() -> Self {
         Self {
             bid_price: 0,
             bid_volume: 0,
@@ -55,8 +55,17 @@ impl BboSnapshot {
     }
 
     #[inline(always)]
-    fn is_crossed(&self) -> bool {
+    pub fn is_crossed(&self) -> bool {
         self.bid_price != 0 && self.ask_price != 0 && self.bid_price > self.ask_price
+    }
+
+    #[inline(always)]
+    pub fn mid_price(&self) -> Option<f64> {
+        if self.bid_price > 0 && self.ask_price > 0 {
+            Some((self.bid_price as f64 + self.ask_price as f64) / 2.0 / 10000.0)
+        } else {
+            None
+        }
     }
 }
 

@@ -1,4 +1,5 @@
 use crate::orderbook::{BboUpdate, BBO_SERIALIZED_SIZE};
+use crate::options::{AggregatedOptionSnapshot, MSG_TYPE_SPOT_BBO};
 use arrayvec::ArrayVec;
 use crossbeam_queue::ArrayQueue;
 use parking_lot::RwLock;
@@ -13,6 +14,7 @@ use tracing::{debug, error, info, warn};
 
 const MAX_CLIENTS: usize = 256;
 const BROADCAST_QUEUE_CAP: usize = 1 << 15;
+const OPTION_QUEUE_CAP: usize = 1 << 13;
 
 #[derive(Error, Debug)]
 pub enum BroadcastError {
@@ -30,9 +32,11 @@ struct ClientConnection {
 pub struct TcpBroadcastServer {
     clients: Arc<RwLock<ArrayVec<ClientConnection, MAX_CLIENTS>>>,
     broadcast_queue: Arc<ArrayQueue<BboUpdate>>,
+    option_queue: Arc<ArrayQueue<AggregatedOptionSnapshot>>,
     listener_addr: SocketAddr,
     running: Arc<std::sync::atomic::AtomicBool>,
     dropped_count: Arc<AtomicU64>,
+    option_dropped_count: Arc<AtomicU64>,
 }
 
 impl TcpBroadcastServer {
@@ -41,7 +45,9 @@ impl TcpBroadcastServer {
             Arc::new(RwLock::new(ArrayVec::new()));
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let broadcast_queue = Arc::new(ArrayQueue::new(BROADCAST_QUEUE_CAP));
+        let option_queue = Arc::new(ArrayQueue::new(OPTION_QUEUE_CAP));
         let dropped_count = Arc::new(AtomicU64::new(0));
+        let option_dropped_count = Arc::new(AtomicU64::new(0));
 
         let listener = TcpListener::bind(bind_addr)?;
         listener.set_nonblocking(true)?;
@@ -62,11 +68,20 @@ impl TcpBroadcastServer {
             let clients_clone = clients.clone();
             let running_clone = running.clone();
             let queue_clone = broadcast_queue.clone();
+            let option_queue_clone = option_queue.clone();
             let dropped_clone = dropped_count.clone();
+            let option_dropped_clone = option_dropped_count.clone();
             thread::Builder::new()
                 .name("tcp-broadcaster".to_string())
                 .spawn(move || {
-                    Self::broadcast_loop(queue_clone, clients_clone, running_clone, dropped_clone);
+                    Self::broadcast_loop(
+                        queue_clone,
+                        option_queue_clone,
+                        clients_clone,
+                        running_clone,
+                        dropped_clone,
+                        option_dropped_clone,
+                    );
                 })
                 .expect("Failed to spawn TCP broadcaster thread");
         }
@@ -76,9 +91,11 @@ impl TcpBroadcastServer {
         Ok(Self {
             clients,
             broadcast_queue,
+            option_queue,
             listener_addr,
             running,
             dropped_count,
+            option_dropped_count,
         })
     }
 
@@ -129,12 +146,17 @@ impl TcpBroadcastServer {
 
     fn broadcast_loop(
         queue: Arc<ArrayQueue<BboUpdate>>,
+        option_queue: Arc<ArrayQueue<AggregatedOptionSnapshot>>,
         clients: Arc<RwLock<ArrayVec<ClientConnection, MAX_CLIENTS>>>,
         running: Arc<std::sync::atomic::AtomicBool>,
         dropped_count: Arc<AtomicU64>,
+        option_dropped_count: Arc<AtomicU64>,
     ) {
         const BATCH_SIZE: usize = 64;
+        const MAX_OPTION_BATCH: usize = 16;
         let mut batch = ArrayVec::<BboUpdate, BATCH_SIZE>::new();
+        let mut option_batch = ArrayVec::<AggregatedOptionSnapshot, MAX_OPTION_BATCH>::new();
+        let mut serialize_buf = Vec::with_capacity(65536);
 
         while running.load(Ordering::Relaxed) {
             while batch.len() < BATCH_SIZE {
@@ -144,30 +166,51 @@ impl TcpBroadcastServer {
                 }
             }
 
-            if batch.is_empty() {
+            while option_batch.len() < MAX_OPTION_BATCH {
+                match option_queue.pop() {
+                    Some(snap) => option_batch.push(snap),
+                    None => break,
+                }
+            }
+
+            if batch.is_empty() && option_batch.is_empty() {
                 thread::sleep(Duration::from_micros(50));
                 continue;
             }
 
-            let mut buf = [0u8; (BBO_SERIALIZED_SIZE + 2) * BATCH_SIZE];
-            let mut total_len = 0usize;
+            serialize_buf.clear();
+
             for bbo in batch.iter() {
                 let header: u16 = BBO_SERIALIZED_SIZE as u16;
-                buf[total_len..total_len + 2].copy_from_slice(&header.to_le_bytes());
-                let payload: &mut [u8; BBO_SERIALIZED_SIZE] = (&mut buf
-                    [total_len + 2..total_len + 2 + BBO_SERIALIZED_SIZE])
-                    .try_into()
-                    .unwrap();
+                serialize_buf.push(MSG_TYPE_SPOT_BBO);
+                serialize_buf.extend_from_slice(&header.to_le_bytes());
+                let old_len = serialize_buf.len();
+                serialize_buf.resize(old_len + BBO_SERIALIZED_SIZE, 0);
+                let payload: &mut [u8; BBO_SERIALIZED_SIZE] =
+                    (&mut serialize_buf[old_len..old_len + BBO_SERIALIZED_SIZE])
+                        .try_into()
+                        .unwrap();
                 bbo.serialize(payload);
-                total_len += 2 + BBO_SERIALIZED_SIZE;
             }
 
-            Self::broadcast_bytes(&clients, &buf[..total_len]);
+            for snap in option_batch.iter() {
+                snap.serialize(&mut serialize_buf);
+            }
+
+            if !serialize_buf.is_empty() {
+                Self::broadcast_bytes(&clients, &serialize_buf);
+            }
+
             batch.clear();
+            option_batch.clear();
 
             let dropped = dropped_count.swap(0, Ordering::Relaxed);
-            if dropped > 0 {
-                warn!("Dropped {} BBO updates due to queue overflow", dropped);
+            let opt_dropped = option_dropped_count.swap(0, Ordering::Relaxed);
+            if dropped > 0 || opt_dropped > 0 {
+                warn!(
+                    "Dropped {} BBO + {} option snapshots due to queue overflow",
+                    dropped, opt_dropped
+                );
             }
         }
     }
@@ -218,6 +261,14 @@ impl TcpBroadcastServer {
     }
 
     #[inline(always)]
+    pub fn enqueue_option_snapshot(&self, snapshot: AggregatedOptionSnapshot) {
+        if let Err(snapshot) = self.option_queue.push(snapshot) {
+            self.option_dropped_count.fetch_add(1, Ordering::Relaxed);
+            drop(snapshot);
+        }
+    }
+
+    #[inline(always)]
     pub fn broadcast_bbo(&self, bbo: &BboUpdate) {
         self.enqueue_bbo(bbo.clone());
     }
@@ -227,7 +278,7 @@ impl TcpBroadcastServer {
     }
 
     pub fn queue_len(&self) -> usize {
-        self.broadcast_queue.len()
+        self.broadcast_queue.len() + self.option_queue.len()
     }
 
     pub fn shutdown(&self) {
@@ -290,9 +341,11 @@ mod tests {
         server.enqueue_bbo(bbo);
         thread::sleep(Duration::from_millis(100));
 
-        let mut header_buf = [0u8; 2];
+        let mut header_buf = [0u8; 3];
         stream.read_exact(&mut header_buf).unwrap();
-        let msg_len = u16::from_le_bytes(header_buf) as usize;
+        let msg_type = header_buf[0];
+        let msg_len = u16::from_le_bytes([header_buf[1], header_buf[2]]) as usize;
+        assert_eq!(msg_type, MSG_TYPE_SPOT_BBO);
         assert_eq!(msg_len, BBO_SERIALIZED_SIZE);
 
         let mut data_buf = vec![0u8; msg_len];
